@@ -1,0 +1,901 @@
+//Implement FreeRTOS    
+
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+						Task 10 – Implement FreeRTOS			stm32f401ceu6
+					Objective
+						Convert super-loop application into RTOS-based design.
+					Tasks
+							•	Enable FreeRTOS (CMSIS-RTOS v2)
+							•	Create tasks:
+							o	SensorTask
+							o	ControlTask
+							o	CommTask
+							o	Status Task
+							•	Replace timer ISR logic with RTOS synchronisation
+					Task Mapping
+							Task	Function
+							SensorTask	Read I2C temp
+							ControlTask	Set PWM
+							CommTask	UART RX/TX
+							StatusTask	LED heartbeat
+					Expected Output
+							•	Same behaviour as before
+							•	No blocking delays
+							•	Stable multitasking
+
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "string.h"
+#include "stdio.h"
+#include "stdbool.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+#define FLASH_CS_PORT    GPIOA
+#define FLASH_CS_PIN     GPIO_PIN_4
+#define flash_cs_low()  HAL_GPIO_WritePin(FLASH_CS_PORT, FLASH_CS_PIN, GPIO_PIN_RESET)      //Pulls CS pin LOW → Selects (activates) the SPI Flash
+#define flash_cs_high() HAL_GPIO_WritePin(FLASH_CS_PORT, FLASH_CS_PIN, GPIO_PIN_SET)		//Pulls CS pin HIGH → Deselects (deactivates) the SPI Flash
+
+#define EVT_SYSTEM_RUN   (1 << 2)
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define RX_BUF_SIZE 64
+uint8_t rxdata[RX_BUF_SIZE];
+uint8_t main_buf[5]; // Linear buffer for comparison
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+SPI_HandleTypeDef hspi1;
+
+TIM_HandleTypeDef htim2;
+
+UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
+
+/* Definitions for SensorTask */
+osThreadId_t SensorTaskHandle;
+const osThreadAttr_t SensorTask_attributes = {
+  .name = "SensorTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for ControlTask */
+osThreadId_t ControlTaskHandle;
+const osThreadAttr_t ControlTask_attributes = {
+  .name = "ControlTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for CommTask */
+osThreadId_t CommTaskHandle;
+const osThreadAttr_t CommTask_attributes = {
+  .name = "CommTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for StatusTask */
+osThreadId_t StatusTaskHandle;
+const osThreadAttr_t StatusTask_attributes = {
+  .name = "StatusTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for FAN_Stop */
+osThreadId_t FAN_StopHandle;
+const osThreadAttr_t FAN_Stop_attributes = {
+  .name = "FAN_Stop",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* USER CODE BEGIN PV */
+osEventFlagsId_t uartEventHandle;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_USART2_UART_Init(void);
+void StartSensorTask(void *argument);
+void StartControlTask(void *argument);
+void StartCommTask(void *argument);
+void StartStatusTask(void *argument);
+void StartFAN_Stop(void *argument);
+
+/* USER CODE BEGIN PFP */
+uint32_t flash_read_id(void);
+float flash_read_temp(void);
+void flash_write_data(float temp, uint8_t pwm);
+void flash_read_data();
+void flash_erase_block(uint16_t page);
+uint8_t flash_is_busy(void);
+void flash_wait_busy(void);
+void flash_page_read(uint16_t page);
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+typedef struct __attribute__((packed))
+{
+    float temperature;
+    uint8_t pwm;
+} FlashData;
+float temp = 0.0f;
+uint32_t pwm = 0;
+osMessageQueueId_t tempQueueHandle;
+const osMessageQueueAttr_t tempQueue_attributes = { .name = "tempQueue" };
+osSemaphoreId_t uartSemHandle;
+const osSemaphoreAttr_t uartSem_attributes = { .name = "uartSem" };
+volatile bool blinking_enabled = 0;
+#define EVT_START   (1 << 0)
+#define EVT_STOP    (1 << 1)
+
+uint32_t flags;
+uint8_t buf[6];
+uint16_t raw_temp;
+float temp_c;
+uint8_t cmd = 0xFD;
+float actual_temp;
+char rxBuffer[10]= {0};
+float temp_rx;
+uint32_t duty;
+
+uint8_t fan_percent = 0;
+uint32_t id;
+uint32_t flash_id;
+float last_temp_stored = 0.0f;
+FlashData data;
+const int zero =0;
+
+volatile bool system_status = 0;
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_I2C1_Init();
+  MX_SPI1_Init();
+  MX_TIM2_Init();
+  MX_USART2_UART_Init();
+  /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, SET); // OFF
+  flash_cs_high();
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rxdata, RX_BUF_SIZE);
+
+  /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  uartEventHandle = osEventFlagsNew(NULL);
+  tempQueueHandle = osMessageQueueNew(5, sizeof(float), NULL);
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of SensorTask */
+  SensorTaskHandle = osThreadNew(StartSensorTask, NULL, &SensorTask_attributes);
+
+  /* creation of ControlTask */
+  ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
+
+  /* creation of CommTask */
+  CommTaskHandle = osThreadNew(StartCommTask, NULL, &CommTask_attributes);
+
+  /* creation of StatusTask */
+  StatusTaskHandle = osThreadNew(StartStatusTask, NULL, &StatusTask_attributes);
+
+  /* creation of FAN_Stop */
+  FAN_StopHandle = osThreadNew(StartFAN_Stop, NULL, &FAN_Stop_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 84;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 12;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SPI1_CS_Pin */
+  GPIO_InitStruct.Pin = SPI1_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(SPI1_CS_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+float process_temperature(void){
+    HAL_StatusTypeDef ret;
+
+    // SHT3x Sensor Address 0x44 << 1
+    ret = HAL_I2C_Master_Transmit(&hi2c1, (0x44 << 1), &cmd, 1, 100);
+    if (ret != HAL_OK) return -1;
+    HAL_Delay(20); // Wait for measurement
+    ret = HAL_I2C_Master_Receive(&hi2c1, (0x44 << 1), buf, 6, 100);
+
+    if (ret != HAL_OK) return -1;
+    raw_temp = (uint16_t)((buf[0] << 8) | buf[1]);
+    actual_temp = -45.0f + (175.0f * (float)raw_temp / 65535.0f);
+    return actual_temp;
+}
+
+void print_uart(char *msg) {
+    if(msg != NULL)
+    	HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+}
+
+
+
+void flash_write_enable(void) {
+    uint8_t cmd = 0x06;
+    flash_cs_low();
+    HAL_SPI_Transmit(&hspi1, &cmd, 1, 10);
+    flash_cs_high();
+    HAL_Delay(1);
+}
+
+void flash_erase_block(uint16_t page)
+{
+    flash_write_enable();
+
+    uint8_t cmd[4]; // Increased to 4 bytes
+    cmd[0] = 0xD8;                   // Block Erase Command
+    cmd[1] = 0x00;                   // DUMMY BYTE (Required for W25N series)
+    cmd[2] = (page >> 8) & 0xFF;     // Page Address High
+    cmd[3] = page & 0xFF;            // Page Address Low
+
+    flash_cs_low();
+    HAL_SPI_Transmit(&hspi1, cmd, 4, HAL_MAX_DELAY); // Transmit 4 bytes
+    flash_cs_high();
+}
+
+uint32_t flash_read_id(void)
+{
+    uint8_t tx_data = 0x9F;
+    uint8_t rx_data[5] = {0}; // Buffer for Command + Dummy + 3 Data bytes
+
+    flash_cs_low();
+    HAL_SPI_Transmit(&hspi1, &tx_data, 1, HAL_MAX_DELAY);
+    HAL_SPI_Receive(&hspi1, rx_data, 4, HAL_MAX_DELAY);
+    flash_cs_high();
+    return ((uint32_t)rx_data[1] << 16) | ((uint32_t)rx_data[2] << 8) | rx_data[3];
+}
+void flash_write_data(float temp, uint8_t pwm)
+{
+    char msg_buf[100];
+
+    uint32_t flash_id = flash_read_id();
+    snprintf(msg_buf, sizeof(msg_buf), "--- System Status ---\r\nSPI Flash ID: %06X\r\n", (unsigned int)flash_id);
+    print_uart(msg_buf);
+
+    uint16_t page = 0;     // Page address
+    uint16_t column = 0;   // Column inside page
+    flash_erase_block(page);
+
+    flash_write_enable();
+
+    data.temperature = temp;
+    data.pwm = pwm;
+
+    uint8_t load_cmd[3];
+    load_cmd[0] = 0x02;
+    load_cmd[1] = (column >> 8) & 0xFF;
+    load_cmd[2] = column & 0xFF;
+
+    flash_cs_low();
+    HAL_SPI_Transmit(&hspi1, load_cmd, 3, HAL_MAX_DELAY);
+    HAL_SPI_Transmit(&hspi1, (uint8_t*)&data, sizeof(FlashData), HAL_MAX_DELAY);
+    flash_cs_high();
+
+    flash_write_enable();
+    uint8_t exec_cmd[4] = { 0x10, 0x00, (page >> 8) & 0xFF, page & 0xFF }; // Add 0x00 dummy
+    flash_cs_low();
+    HAL_SPI_Transmit(&hspi1, exec_cmd, 4, HAL_MAX_DELAY); // Send 4 bytes
+    flash_cs_high();
+
+    while(flash_is_busy());
+
+    print_uart("Flash Write: OK\r\n");
+//    flash_read_data();
+}
+void flash_page_read(uint16_t page)
+{
+    uint8_t cmd[4];
+
+    cmd[0] = 0x13;             // Page Data Read
+    cmd[1] = 0x00;             // Dummy byte
+    cmd[2] = (page >> 8) & 0xFF;
+    cmd[3] = page & 0xFF;
+
+    flash_cs_low();
+    HAL_SPI_Transmit(&hspi1, cmd, 4, HAL_MAX_DELAY);
+    flash_cs_high();
+
+    while(flash_is_busy());
+}
+
+void flash_read_data()
+{
+    uint8_t cmd[4] = {0x03, 0x00, 0x00, 0x00};
+    flash_cs_low();
+    HAL_SPI_Transmit(&hspi1, cmd,4, 100);
+    HAL_SPI_Receive(&hspi1, (uint8_t*)&data, sizeof(FlashData), 100);
+    flash_cs_high();
+    char data_read[64] = {0};
+    HAL_Delay(10);
+    snprintf(data_read, sizeof(data_read),"Flash Read: %.1f°C, PWM=%d %%\r\n", data.temperature, data.pwm);
+    print_uart(data_read);
+}
+
+uint8_t flash_is_busy(void)
+{
+    uint8_t tx[3] = {0x0F, 0xC0, 0xFF};
+    uint8_t rx[3] = {0};
+
+    flash_cs_low();
+    HAL_SPI_TransmitReceive(&hspi1, tx, rx, 3, HAL_MAX_DELAY);
+    flash_cs_high();
+
+    return (rx[2] & 0x01);   // BUSY bit
+}
+
+void flash_wait_busy(void)
+{
+    uint8_t cmd[2];
+    uint8_t status;
+
+    cmd[0] = 0x0F;   // Get Feature command
+    cmd[1] = 0xC0;   // Status Register address
+
+    do
+    {
+        flash_cs_low();
+
+        HAL_SPI_Transmit(&hspi1, cmd, 2, HAL_MAX_DELAY);
+        HAL_SPI_Receive(&hspi1, &status, 1, HAL_MAX_DELAY);
+
+        flash_cs_high();
+
+    } while (status & 0x01);   // Check BUSY bit (bit 0)
+}
+
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+        /* Null terminate safely */
+        if (Size < RX_BUF_SIZE)
+            rxdata[Size] = '\0';
+        /* Process command */
+        if (strncmp((char*)rxdata, "START", 5) == 0)
+        {
+        	system_status = 1;
+            osEventFlagsSet(uartEventHandle, EVT_START);
+        }
+        else if (strncmp((char*)rxdata, "STOP", 4) == 0)
+        {
+        	fan_percent = 100;
+        	system_status = 0;
+        	osEventFlagsSet(uartEventHandle, EVT_STOP);
+        }
+        /* Restart DMA reception */
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart2, rxdata, RX_BUF_SIZE);
+        __HAL_DMA_DISABLE_IT(huart2.hdmarx, DMA_IT_HT);
+}
+
+
+/* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartSensorTask */
+/**
+  * @brief  Function implementing the SensorTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartSensorTask */
+void StartSensorTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+	  if(system_status){
+		  float temperature = process_temperature();
+	      if(temperature != -1)
+	      {
+	    	  osMessageQueuePut(tempQueueHandle, &temperature, 0, 0);
+	    	  osDelay(1000);
+	      }
+	  }
+  /* USER CODE END 5 */
+  }
+}
+
+/* USER CODE BEGIN Header_StartControlTask */
+/**
+* @brief Function implementing the ControlTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartControlTask */
+void StartControlTask(void *argument)
+{
+    for(;;)
+    {
+        /* Wait for temperature from SensorTask */
+        if(osMessageQueueGet(tempQueueHandle, &temp_rx, NULL, 	osWaitForever) == osOK)
+        {
+            if(system_status){
+				if(temp_rx < 25)
+					duty = 20;
+				else if(temp_rx <= 30)
+					duty = 50;
+				else
+					duty = 80;
+				/* Convert % to CCR value (ARR = 255) */
+				fan_percent = (duty * 255) / 100;
+				__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, fan_percent);
+
+				/* Store latest values */
+				flash_read_data();
+				flash_write_data(temp_rx, duty);
+            }
+            else{
+            	// Stop fan
+//            	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+//            	HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+            }
+        }
+//        if(system_status==0){
+//        	__HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, zero);
+//        	continue;
+    }
+}
+/* USER CODE BEGIN Header_StartCommTask */
+/**
+* @brief Function implementing the CommTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCommTask */
+void StartCommTask(void *argument)
+{
+	uint32_t flags;
+	for(;;){
+// Wait and automatically clear the flags
+		flags = osEventFlagsWait(uartEventHandle, EVT_START | EVT_STOP, osFlagsWaitAny, osWaitForever);
+		if (flags & EVT_START)
+		{
+			char msg[] = "CMD: START -> System and led blinking Running\r\n";
+			HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+			HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+		}
+//		if (flags & EVT_STOP)
+//		{
+//			char msg[] = "CMD: STOP -> System and led blinking Halted\r\n";
+//			HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+//		    HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+//		}
+	}
+}
+/* USER CODE BEGIN Header_StartStatusTask */
+/**
+* @brief Function implementing the StatusTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartStatusTask */
+void StartStatusTask(void *argument)
+{
+    uint32_t flags;
+
+    for(;;)
+    {
+        flags = osEventFlagsWait(uartEventHandle,  EVT_SYSTEM_RUN, osFlagsWaitAll | osFlagsNoClear,100);
+        if (flags & EVT_SYSTEM_RUN)
+        {
+            HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            osDelay(1000);
+        }
+//        else
+//        {
+//            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, 0); // OFF
+//        }
+    }
+}
+/* USER CODE BEGIN Header_StartFAN_Stop */
+/**
+* @brief Function implementing the FAN_Stop thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartFAN_Stop */
+void StartFAN_Stop(void *argument)
+{
+  /* USER CODE BEGIN StartFAN_Stop */
+  /* Infinite loop */
+  for(;;)
+  {
+	  if (flags & EVT_STOP)
+	  {
+		  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
+		  char msg[] = "STOP fan\r\n";
+		  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+	  }
+}
+  /* USER CODE END StartFAN_Stop */
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
